@@ -1,0 +1,75 @@
+name: Compress and Upload to udrop
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'Direct HTTPS URL to the video'
+        required: true
+        type: string
+      target_size_gb:
+        description: 'Target File Size in GB (e.g., 2)'
+        required: true
+        default: '2'
+        type: string
+
+jobs:
+  compress-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free Up Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /usr/local/lib/android
+
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Download Video
+        run: curl -L "${{ inputs.video_url }}" -o input_file
+
+      - name: Calculate Bitrate and Compress
+        run: |
+          DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 input_file)
+          TARGET_SIZE_BITS=$(echo "${{ inputs.target_size_gb }} * 1024 * 1024 * 1024 * 8" | bc)
+          AUDIO_STREAMS=$(ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 input_file | wc -l)
+          TOTAL_AUDIO_BITRATE=$((AUDIO_STREAMS * 192000))
+          TOTAL_BITRATE=$(echo "scale=0; $TARGET_SIZE_BITS / $DURATION" | bc)
+          VIDEO_BITRATE=$((TOTAL_BITRATE - TOTAL_AUDIO_BITRATE))
+          
+          if [ $VIDEO_BITRATE -lt 500000 ]; then
+            VIDEO_BITRATE=500000
+          fi
+
+          echo "Encoding with target video bitrate..."
+          ffmpeg -y -i input_file -c:v libx264 -b:v ${VIDEO_BITRATE} -pass 1 -preset fast -an -f null /dev/null
+          ffmpeg -i input_file -c:v libx264 -b:v ${VIDEO_BITRATE} -pass 2 -preset fast -map 0:v? -map 0:a -c:a aac -b:a 192k output_video.mp4
+
+      - name: Upload to udrop
+        env:
+          UDROP_KEY1: ${{ secrets.UDROP_KEY1 }}
+          UDROP_KEY2: ${{ secrets.UDROP_KEY2 }}
+        run: |
+          echo "Authenticating with udrop..."
+          AUTH_RESPONSE=$(curl -s -X POST https://www.udrop.com/api/v2/authorize \
+            -d "key1=$UDROP_KEY1" \
+            -d "key2=$UDROP_KEY2")
+          
+          ACCESS_TOKEN=$(echo $AUTH_RESPONSE | grep -o '"access_token":"[^"]*' | grep -o '[^"]*$' )
+          ACCOUNT_ID=$(echo $AUTH_RESPONSE | grep -o '"account_id":[^,}]*' | grep -o '[0-9]*' )
+
+          if [ -z "$ACCESS_TOKEN" ]; then
+            echo "Error: Failed to authenticate with udrop."
+            exit 1
+          fi
+
+          echo "Uploading compressed video to udrop..."
+          curl -s -X POST https://www.udrop.com/api/v2/file/upload \
+            -F "access_token=$ACCESS_TOKEN" \
+            -F "account_id=$ACCOUNT_ID" \
+            -F "upload_file=@output_video.mp4"
+
+          echo "Upload complete!"
