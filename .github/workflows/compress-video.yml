@@ -1,4 +1,4 @@
-name: Compress and Upload to udrop
+name: Fast High-Speed Video Compression and Upload
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       target_size_gb:
-        description: 'Target File Size in GB (e.g., 2)'
+        description: 'Target File Size in GB (e.g., 0.5 for 500MB)'
         required: true
         default: '2'
         type: string
@@ -25,28 +25,37 @@ jobs:
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
           sudo rm -rf /usr/local/lib/android
 
-      - name: Install FFmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install Tools (FFmpeg & Aria2)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg aria2
 
-      - name: Download Video
-        run: curl -L "${{ inputs.video_url }}" -o input_file
+      - name: Download Video with Multi-Stream Aria2
+        run: |
+          echo "Downloading via multi-connection aria2c..."
+          # -x16 opens up to 16 parallel connections to download chunks concurrently
+          aria2c -x 16 -s 16 "${{ inputs.video_url }}" -o input_file
 
-      - name: Calculate Bitrate and Compress
+      - name: Fast Single-Pass Target Compression
         run: |
           DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 input_file)
           TARGET_SIZE_BITS=$(echo "${{ inputs.target_size_gb }} * 1024 * 1024 * 1024 * 8" | bc)
           AUDIO_STREAMS=$(ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 input_file | wc -l)
-          TOTAL_AUDIO_BITRATE=$((AUDIO_STREAMS * 192000))
+          TOTAL_AUDIO_BITRATE=$((AUDIO_STREAMS * 128000))
           TOTAL_BITRATE=$(echo "scale=0; $TARGET_SIZE_BITS / $DURATION" | bc)
           VIDEO_BITRATE=$((TOTAL_BITRATE - TOTAL_AUDIO_BITRATE))
           
-          if [ $VIDEO_BITRATE -lt 500000 ]; then
-            VIDEO_BITRATE=500000
+          if [ $VIDEO_BITRATE -lt 400000 ]; then
+            VIDEO_BITRATE=400000
           fi
 
-          echo "Encoding with target video bitrate..."
-          ffmpeg -y -i input_file -c:v libx264 -b:v ${VIDEO_BITRATE} -pass 1 -preset fast -an -f null /dev/null
-          ffmpeg -i input_file -c:v libx264 -b:v ${VIDEO_BITRATE} -pass 2 -preset fast -map 0:v? -map 0:a -c:a aac -b:a 192k output_video.mp4
+          echo "Encoding with ultrafast preset..."
+          # Using -preset ultrafast skips heavy CPU processing delays while hitting your size target
+          ffmpeg -y -i input_file \
+            -map 0:v? -map 0:a \
+            -c:v libx264 -b:v ${VIDEO_BITRATE} -preset ultrafast \
+            -c:a aac -b:a 128k \
+            output_video.mp4
+
+          ls -lh input_file output_video.mp4
 
       - name: Upload to udrop
         env:
