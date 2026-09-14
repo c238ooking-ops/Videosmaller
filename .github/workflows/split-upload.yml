@@ -34,10 +34,16 @@ jobs:
         with:
           node-version: 20
 
+      - name: Cache APT Packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-media-tools-${{ runner.os }}
+
       - name: Install System Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y mkvtoolnix aria2
+          sudo apt-get install -y --no-install-recommends mkvtoolnix aria2
 
       - name: High-Speed Multi-Connection Download (aria2c)
         run: |
