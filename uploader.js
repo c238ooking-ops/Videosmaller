@@ -1,4 +1,5 @@
 import fs from "fs";
+import https from "https";
 
 const API_BASE = "https://www.udrop.com/api/v2";
 
@@ -15,13 +16,10 @@ if (ACCOUNTS.length === 0) {
   process.exit(1);
 }
 
-const tunnelUrl = process.env.TUNNEL_URL;
-const baseName = process.env.BASE_NAME || "Video";
-
-if (!tunnelUrl) {
-  console.error("❌ No TUNNEL_URL provided.");
-  process.exit(1);
-}
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  timeout: 120000
+});
 
 async function authorize(key1, key2) {
   const res = await fetch(`${API_BASE}/authorize`, {
@@ -57,50 +55,108 @@ async function getFreeSpace(token, accountId) {
   return 100 * 1024 * 1024 * 1024;
 }
 
-// Submits the remote URL into uDrop's server-side download queue
-async function remoteUrlUpload(downloadUrl, token, accountId) {
-  const res = await fetch(`${API_BASE}/file/url_upload`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      access_token: token,
-      account_id: accountId,
-      url: downloadUrl
-    })
+function uploadStream(filePath, fileName, token, accountId) {
+  return new Promise((resolve, reject) => {
+    const boundary = "----WebKitFormBoundary" + Math.random().toString(36).substring(2);
+    const stats = fs.statSync(filePath);
+    const totalSize = stats.size;
+
+    const head = [
+      `--${boundary}`,
+      `Content-Disposition: form-data; name="access_token"`,
+      "",
+      token,
+      `--${boundary}`,
+      `Content-Disposition: form-data; name="account_id"`,
+      "",
+      accountId,
+      `--${boundary}`,
+      `Content-Disposition: form-data; name="files[]"; filename="${fileName}"`,
+      "Content-Type: video/x-matroska",
+      "",
+      ""
+    ].join("\r\n");
+
+    const tail = `\r\n--${boundary}--\r\n`;
+    const contentLength = Buffer.byteLength(head) + totalSize + Buffer.byteLength(tail);
+
+    const req = https.request("https://www.udrop.com/api/v2/file/upload", {
+      method: "POST",
+      agent: httpsAgent,
+      headers: {
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        "Content-Length": contentLength,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+      }
+    }, (res) => {
+      let body = "";
+      res.on("data", chunk => { body += chunk; });
+      res.on("end", () => {
+        try {
+          const data = JSON.parse(body);
+          if (data._status === "success") {
+            resolve(data);
+          } else {
+            reject(new Error(data.response || JSON.stringify(data)));
+          }
+        } catch (e) {
+          reject(new Error(`Invalid server response: ${body.substring(0, 300)}`));
+        }
+      });
+    });
+
+    req.on("error", reject);
+    req.write(head);
+
+    const fileStream = fs.createReadStream(filePath, { highWaterMark: 128 * 1024 });
+    let uploadedBytes = 0;
+    let lastReport = 0;
+
+    fileStream.on("data", (chunk) => {
+      uploadedBytes += chunk.length;
+      fileStream.pause();
+
+      const canContinue = req.write(chunk);
+
+      const now = Date.now();
+      if (now - lastReport > 3000) {
+        const pct = ((uploadedBytes / totalSize) * 100).toFixed(1);
+        const mb = (uploadedBytes / (1024 * 1024)).toFixed(0);
+        const totalMb = (totalSize / (1024 * 1024)).toFixed(0);
+        console.log(`   ⏳ Transferred: ${mb}MB / ${totalMb}MB (${pct}%)`);
+        lastReport = now;
+      }
+
+      if (!canContinue) {
+        req.once("drain", () => setTimeout(() => fileStream.resume(), 10));
+      } else {
+        setTimeout(() => fileStream.resume(), 10);
+      }
+    });
+
+    fileStream.on("end", () => {
+      req.write(tail);
+      req.end();
+    });
+
+    fileStream.on("error", (err) => {
+      req.destroy();
+      reject(err);
+    });
   });
-  const data = await res.json();
-  if (data._status !== "success") {
-    throw new Error(data.response || JSON.stringify(data));
-  }
-  return data;
 }
 
 async function run() {
-  const filesDir = "./public_files";
-  const rawFiles = fs.readdirSync(filesDir)
+  const baseName = process.env.BASE_NAME || "Video";
+  const files = fs.readdirSync(".")
     .filter(f => f.startsWith("part-") && f.endsWith(".mkv"))
     .sort();
 
-  if (rawFiles.length === 0) {
+  if (files.length === 0) {
     console.error("❌ No split files found to upload.");
     process.exit(1);
   }
 
-  // 1. Rename files locally to final target names so Python serves them cleanly
-  const isMultiPart = rawFiles.length > 1;
-  const readyFiles = [];
-
-  let idx = 1;
-  for (const f of rawFiles) {
-    const targetName = isMultiPart ? `${baseName}.Part${idx}.mkv` : `${baseName}.mkv`;
-    fs.renameSync(`${filesDir}/${f}`, `${filesDir}/${targetName}`);
-    
-    const size = fs.statSync(`${filesDir}/${targetName}`).size;
-    readyFiles.push({ name: targetName, size });
-    idx++;
-  }
-
-  // 2. Query account capacities
   const pool = [];
   for (const acc of ACCOUNTS) {
     try {
@@ -119,29 +175,49 @@ async function run() {
     process.exit(1);
   }
 
-  // 3. Queue files into uDrop via the tunnel URL
-  for (const file of readyFiles) {
-    console.log(`\n📦 Processing: ${file.name} (${(file.size / (1024 ** 3)).toFixed(2)} GB)`);
+  const isMultiPart = files.length > 1;
+  let partIndex = 1;
 
-    const targetAcc = pool.find(acc => acc.freeBytes > (file.size + 200 * 1024 * 1024));
+  for (const file of files) {
+    const stats = fs.statSync(file);
+    const fileSize = stats.size;
+    const targetName = isMultiPart 
+      ? `${baseName}.Part${partIndex}.mkv` 
+      : `${baseName}.mkv`;
+
+    console.log(`\n📦 Processing: ${targetName} (${(fileSize / (1024 ** 3)).toFixed(2)} GB)`);
+
+    const targetAcc = pool.find(acc => acc.freeBytes > (fileSize + 200 * 1024 * 1024));
     if (!targetAcc) {
-      console.error(`❌ Out of storage! No account has enough space for ${file.name}`);
+      console.error(`❌ Out of storage! No account has enough space for ${targetName}`);
       process.exit(1);
     }
 
-    const publicDownloadUrl = `${tunnelUrl}/${encodeURIComponent(file.name)}`;
-    console.log(`🚀 Sending Remote URL to [${targetAcc.name}]...`);
-    console.log(`   🔗 Source: ${publicDownloadUrl}`);
+    console.log(`🚀 Uploading to [${targetAcc.name}]...`);
 
-    await remoteUrlUpload(publicDownloadUrl, targetAcc.token, targetAcc.accountId);
-    console.log(`✅ Remote download successfully queued on uDrop servers!`);
+    let uploaded = false;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await uploadStream(file, targetName, targetAcc.token, targetAcc.accountId);
+        uploaded = true;
+        console.log(`✅ Upload complete for ${targetName}!`);
+        break;
+      } catch (err) {
+        console.warn(`   ⚠️ Attempt ${attempt} failed (${err.message}). Retrying in 5s...`);
+        await new Promise((r) => setTimeout(r, 5000));
+      }
+    }
 
-    targetAcc.freeBytes -= file.size;
+    if (!uploaded) {
+      console.error(`❌ Failed to upload ${targetName} after 3 attempts.`);
+      process.exit(1);
+    }
+
+    targetAcc.freeBytes -= fileSize;
+    partIndex++;
   }
 
-  console.log("\n⏳ Waiting 45 seconds to allow uDrop servers to pull all files across the tunnel...");
-  await new Promise(r => setTimeout(r, 45000));
-  console.log("🎉 Transfer session complete!");
+  console.log("\n🎉 All chunks successfully uploaded and distributed!");
 }
 
 run();
