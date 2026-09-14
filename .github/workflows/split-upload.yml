@@ -7,7 +7,7 @@ on:
         description: 'Direct HTTPS URL to the video'
         required: true
       file_name:
-        description: 'Target Base Name (e.g. Oppenheimer.2023.1080p)'
+        description: 'Target Base Name (e.g. Spider-Man.2.2004.1080p)'
         required: true
 
 permissions:
@@ -40,11 +40,11 @@ jobs:
           path: /var/cache/apt/archives
           key: apt-media-tools-${{ runner.os }}
 
-      - name: Install System Tools
+      - name: Install System Tools (FFmpeg, MKVToolNix, Aria2)
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg mkvtoolnix aria2
-          
+          sudo apt-get install -y --no-install-recommends ffmpeg mkvtoolnix aria2
+
       - name: High-Speed Multi-Connection Download (aria2c)
         run: |
           echo "Downloading source file via 16 parallel sockets..."
@@ -54,24 +54,19 @@ jobs:
             -o "source_input.mkv" \
             "${{ inputs.file_url }}"
 
-      - name: Lossless Split (<3.8GB Safe Ingress Chunks)
+      - name: Lossless Slice to MPEG-TS (Stream-Concatenation Ready)
         run: |
-          echo "Splitting container losslessly without re-encoding..."
-          
-          mkvmerge \
-            --engage append_and_split_flac \
-            --split size:3800M \
-            -o "part-%02d.mkv" \
-            "source_input.mkv" || MERGE_STATUS=$?
+          echo "Slicing lossless MPEG-TS segments (1 hour cuts, <3.8GB safe limit)..."
+          ffmpeg -y -i "source_input.mkv" \
+            -c copy \
+            -map 0:v -map 0:a \
+            -f segment \
+            -segment_time 3600 \
+            -reset_timestamps 0 \
+            "part-%02d.ts"
 
-          if [ "${MERGE_STATUS:-0}" -gt 1 ]; then
-            echo "❌ Fatal error during mkvmerge execution: $MERGE_STATUS"
-            exit $MERGE_STATUS
-          fi
-
-          echo "✅ Split finished successfully."
           rm -f "source_input.mkv"
-          ls -lh part-*.mkv
+          ls -lh part-*.ts
 
       - name: Distribute Chunks to uDrop Accounts
         env:
