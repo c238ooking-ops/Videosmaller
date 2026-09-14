@@ -18,7 +18,7 @@ if (ACCOUNTS.length === 0) {
 
 const httpsAgent = new https.Agent({
   keepAlive: true,
-  timeout: 120000
+  timeout: 180000
 });
 
 async function authorize(key1, key2) {
@@ -61,6 +61,7 @@ function uploadStream(filePath, fileName, token, accountId) {
     const stats = fs.statSync(filePath);
     const totalSize = stats.size;
 
+    // upload_file is the official parameter name documented on udrop.com/api
     const head = [
       `--${boundary}`,
       `Content-Disposition: form-data; name="access_token"`,
@@ -71,8 +72,8 @@ function uploadStream(filePath, fileName, token, accountId) {
       "",
       accountId,
       `--${boundary}`,
-      `Content-Disposition: form-data; name="files[]"; filename="${fileName}"`,
-      "Content-Type: video/x-matroska",
+      `Content-Disposition: form-data; name="upload_file"; filename="${fileName}"`,
+      "Content-Type: application/octet-stream",
       "",
       ""
     ].join("\r\n");
