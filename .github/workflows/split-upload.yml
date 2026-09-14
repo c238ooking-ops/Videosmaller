@@ -1,4 +1,4 @@
-name: Remote Split & Multi-Account Upload
+name: Remote Split & Cloudflare Tunnel Upload
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 jobs:
-  split_and_upload:
+  split_and_tunnel_upload:
     runs-on: ubuntu-latest
 
     steps:
@@ -26,28 +26,32 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install System Dependencies
+      - name: Install Dependencies & Cloudflared
         run: |
           sudo apt-get update
-          sudo apt-get install -y mkvtoolnix aria2
+          sudo apt-get install -y mkvtoolnix aria2 curl python3
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          rm -f cloudflared.deb
 
       - name: High-Speed Multi-Connection Download (aria2c)
         run: |
-          echo "Starting multi-connection download..."
+          echo "Downloading source file..."
           aria2c -x 16 -s 16 -k 1M \
             --file-allocation=none \
             --summary-interval=5 \
             -o "source_input.mkv" \
             "${{ inputs.file_url }}"
 
-      - name: Split File into Playable Segments (<4GB)
+      - name: Split File into Playable Segments (<4.8GB)
         run: |
-          echo "Splitting media losslessly across all tracks/codecs..."
+          echo "Splitting media losslessly..."
+          mkdir -p public_files
           
           mkvmerge \
             --engage append_and_split_flac \
-            --split size:3800M \
-            -o "part-%02d.mkv" \
+            --split size:4700M \
+            -o "public_files/part-%02d.mkv" \
             "source_input.mkv" || MERGE_STATUS=$?
 
           if [ "${MERGE_STATUS:-0}" -gt 1 ]; then
@@ -55,12 +59,41 @@ jobs:
             exit $MERGE_STATUS
           fi
 
-          echo "✅ Split completed successfully (Exit status: ${MERGE_STATUS:-0})"
           rm -f "source_input.mkv"
-          ls -lh part-*.mkv
+          ls -lh public_files/
 
-      - name: Distribute Chunks Across Accounts
+      - name: Start File Server & Cloudflare Tunnel
+        id: tunnel
+        run: |
+          # 1. Start Python HTTP Server inside the split files folder
+          nohup python3 -m http.server 8080 --directory public_files > server.log 2>&1 &
+          
+          # 2. Start Cloudflare Tunnel
+          cloudflared tunnel --url http://localhost:8080 > tunnel.log 2>&1 &
+          
+          # 3. Wait for tunnel URL to generate
+          echo "Waiting for Cloudflare Tunnel to spin up..."
+          TUNNEL_URL=""
+          for i in {1..30}; do
+            TUNNEL_URL=$(grep -o 'https://[-a-zA-Z0-9]\+\.trycloudflare\.com' tunnel.log | head -n 1 || true)
+            if [ -n "$TUNNEL_URL" ]; then
+              break
+            fi
+            sleep 2
+          done
+
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "❌ Failed to create Cloudflare Tunnel."
+            cat tunnel.log
+            exit 1
+          fi
+
+          echo "✅ Tunnel active: $TUNNEL_URL"
+          echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+
+      - name: Ingest Chunks to uDrop via Remote URL Upload
         env:
           UDROP_ACCOUNTS_JSON: ${{ secrets.UDROP_ACCOUNTS_JSON }}
           BASE_NAME: ${{ inputs.file_name }}
+          TUNNEL_URL: ${{ env.TUNNEL_URL }}
         run: node uploader.js
