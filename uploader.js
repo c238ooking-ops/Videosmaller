@@ -1,9 +1,8 @@
 import fs from "fs";
-import path from "path";
+import https from "https";
 
 const API_BASE = "https://www.udrop.com/api/v2";
 
-// 1. Parse accounts
 let ACCOUNTS = [];
 try {
   ACCOUNTS = JSON.parse(process.env.UDROP_ACCOUNTS_JSON || "[]");
@@ -17,7 +16,6 @@ if (ACCOUNTS.length === 0) {
   process.exit(1);
 }
 
-// 2. Auth helper
 async function authorize(key1, key2) {
   const res = await fetch(`${API_BASE}/authorize`, {
     method: "POST",
@@ -29,7 +27,6 @@ async function authorize(key1, key2) {
   return { token: data.data.access_token, accountId: data.data.account_id };
 }
 
-// 3. Get free space in bytes
 async function getFreeSpace(token, accountId) {
   try {
     const res = await fetch(`${API_BASE}/account/details`, {
@@ -38,44 +35,100 @@ async function getFreeSpace(token, accountId) {
       body: new URLSearchParams({ access_token: token, account_id: accountId })
     });
     const data = await res.json();
-
     if (data._status === "success" && data.data) {
       const total = Number(data.data.total_storage_bytes || data.data.storage_limit_bytes || 0);
       const used = Number(data.data.used_storage_bytes || data.data.storage_used_bytes || 0);
-      
-      // If unlimited or unmetered, return plenty of space
-      if (total === 0) return 100 * 1024 * 1024 * 1024; 
+      if (total === 0) return 100 * 1024 * 1024 * 1024;
       return Math.max(0, total - used);
     }
   } catch (err) {
     console.warn(`Could not check space: ${err.message}`);
   }
-  // Default fallback if endpoint format differs: assume free space available
   return 10 * 1024 * 1024 * 1024;
 }
 
-// 4. File uploader using native FormData
-async function uploadFile(filePath, fileName, token, accountId) {
-  const fileBuffer = fs.readFileSync(filePath);
-  const blob = new Blob([fileBuffer]);
+// Streams 4.7GB+ straight from filesystem into the HTTP request (prevents OOM crash)
+function uploadStream(filePath, fileName, token, accountId) {
+  return new Promise((resolve, reject) => {
+    const boundary = "----WebKitFormBoundary" + Math.random().toString(36).substring(2);
+    const stats = fs.statSync(filePath);
+    const totalSize = stats.size;
 
-  const form = new FormData();
-  form.append("access_token", token);
-  form.append("account_id", accountId);
-  form.append("files", blob, fileName);
+    const head = [
+      `--${boundary}`,
+      `Content-Disposition: form-data; name="access_token"`,
+      "",
+      token,
+      `--${boundary}`,
+      `Content-Disposition: form-data; name="account_id"`,
+      "",
+      accountId,
+      `--${boundary}`,
+      `Content-Disposition: form-data; name="files"; filename="${fileName}"`,
+      "Content-Type: video/x-matroska",
+      "",
+      ""
+    ].join("\r\n");
 
-  const res = await fetch(`${API_BASE}/file/upload`, {
-    method: "POST",
-    body: form
+    const tail = `\r\n--${boundary}--\r\n`;
+    const contentLength = Buffer.byteLength(head) + totalSize + Buffer.byteLength(tail);
+
+    const req = https.request("https://www.udrop.com/api/v2/file/upload", {
+      method: "POST",
+      headers: {
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        "Content-Length": contentLength
+      }
+    }, (res) => {
+      let body = "";
+      res.on("data", chunk => { body += chunk; });
+      res.on("end", () => {
+        try {
+          const data = JSON.parse(body);
+          if (data._status === "success") {
+            resolve(data);
+          } else {
+            reject(new Error(data.response || "Upload rejected"));
+          }
+        } catch (e) {
+          reject(new Error(`Invalid response: ${body.substring(0, 200)}`));
+        }
+      });
+    });
+
+    req.on("error", reject);
+
+    // Track upload progress
+    let uploadedBytes = 0;
+    let lastReport = 0;
+    const fileStream = fs.createReadStream(filePath);
+
+    req.write(head);
+
+    fileStream.on("data", (chunk) => {
+      uploadedBytes += chunk.length;
+      const now = Date.now();
+      if (now - lastReport > 4000) { // Log every 4s
+        const pct = ((uploadedBytes / totalSize) * 100).toFixed(1);
+        const mb = (uploadedBytes / (1024 * 1024)).toFixed(0);
+        const totalMb = (totalSize / (1024 * 1024)).toFixed(0);
+        console.log(`   ⏳ Transferred: ${mb}MB / ${totalMb}MB (${pct}%)`);
+        lastReport = now;
+      }
+    });
+
+    fileStream.on("end", () => {
+      req.write(tail);
+      req.end();
+    });
+
+    fileStream.on("error", (err) => {
+      req.destroy();
+      reject(err);
+    });
   });
-  const data = await res.json();
-  if (data._status !== "success") {
-    throw new Error(data.response || "Upload failed");
-  }
-  return data;
 }
 
-// 5. Main Distribution Loop
 async function run() {
   const baseName = process.env.BASE_NAME || "Video";
   const files = fs.readdirSync(".")
@@ -87,7 +140,6 @@ async function run() {
     process.exit(1);
   }
 
-  // Pre-authenticate and check capacity for all accounts
   const pool = [];
   for (const acc of ACCOUNTS) {
     try {
@@ -106,7 +158,6 @@ async function run() {
     process.exit(1);
   }
 
-  // Distribute chunks
   let partIndex = 1;
   for (const file of files) {
     const stats = fs.statSync(file);
@@ -115,24 +166,21 @@ async function run() {
 
     console.log(`\n📦 Processing: ${targetName} (${(fileSize / (1024 ** 3)).toFixed(2)} GB)`);
 
-    // Find first account that has enough free space (with a 200MB safety buffer)
     const targetAcc = pool.find(acc => acc.freeBytes > (fileSize + 200 * 1024 * 1024));
-
     if (!targetAcc) {
       console.error(`❌ Out of storage! None of your accounts have enough free space for ${targetName}`);
       process.exit(1);
     }
 
     console.log(`🚀 Uploading to [${targetAcc.name}]...`);
-    await uploadFile(file, targetName, targetAcc.token, targetAcc.accountId);
-    console.log(`✅ Upload complete!`);
+    await uploadStream(file, targetName, targetAcc.token, targetAcc.accountId);
+    console.log(`✅ Upload complete for ${targetName}!`);
 
-    // Deduct size from local pool tracking
     targetAcc.freeBytes -= fileSize;
     partIndex++;
   }
 
-  console.log("\n🎉 All parts successfully distributed across your uDrop accounts!");
+  console.log("\n🎉 All chunks successfully processed and uploaded!");
 }
 
 run();
