@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: 'Direct HTTPS URL of the large video'
+        description: 'Direct HTTPS URL to the video'
         required: true
       file_name:
         description: 'Target Base Name (e.g. Oppenheimer.2023.1080p)'
@@ -18,6 +18,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Free Up Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /usr/local/lib/android
+
       - name: Checkout Repository
         uses: actions/checkout@v4
 
@@ -26,39 +34,40 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install Dependencies
+      - name: Install System Tools
         run: |
           sudo apt-get update
           sudo apt-get install -y mkvtoolnix aria2
 
       - name: High-Speed Multi-Connection Download (aria2c)
         run: |
-          echo "Downloading source file..."
+          echo "Downloading source file via 16 parallel sockets..."
           aria2c -x 16 -s 16 -k 1M \
             --file-allocation=none \
             --summary-interval=5 \
             -o "source_input.mkv" \
             "${{ inputs.file_url }}"
 
-      - name: Split File into Playable Segments (<2GB Safe Limit)
+      - name: Lossless Split (<3.8GB Safe Ingress Chunks)
         run: |
-          echo "Splitting media losslessly..."
+          echo "Splitting container losslessly without re-encoding..."
           
           mkvmerge \
             --engage append_and_split_flac \
-            --split size:1900M \
+            --split size:3800M \
             -o "part-%02d.mkv" \
             "source_input.mkv" || MERGE_STATUS=$?
 
           if [ "${MERGE_STATUS:-0}" -gt 1 ]; then
-            echo "❌ mkvmerge failed with fatal exit code $MERGE_STATUS"
+            echo "❌ Fatal error during mkvmerge execution: $MERGE_STATUS"
             exit $MERGE_STATUS
           fi
 
+          echo "✅ Split finished successfully."
           rm -f "source_input.mkv"
           ls -lh part-*.mkv
 
-      - name: Distribute Chunks Across Accounts
+      - name: Distribute Chunks to uDrop Accounts
         env:
           UDROP_ACCOUNTS_JSON: ${{ secrets.UDROP_ACCOUNTS_JSON }}
           BASE_NAME: ${{ inputs.file_name }}
