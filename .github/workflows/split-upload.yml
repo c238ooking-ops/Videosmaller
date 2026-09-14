@@ -42,8 +42,22 @@ jobs:
 
       - name: Split File into Playable Segments (<4.7GB)
         run: |
-          echo "Splitting media losslessly..."
-          mkvmerge -o "part-%02d.mkv" --split size:4700M "source_input.mkv"
+          echo "Splitting media losslessly across all tracks/codecs..."
+          
+          # Run mkvmerge with FLAC engagement and catch exit codes
+          mkvmerge \
+            --engage append_and_split_flac \
+            --split size:4700M \
+            -o "part-%02d.mkv" \
+            "source_input.mkv" || MERGE_STATUS=$?
+
+          # Exit code 0 = success, 1 = success with warnings, 2+ = fatal error
+          if [ "${MERGE_STATUS:-0}" -gt 1 ]; then
+            echo "❌ mkvmerge failed with fatal exit code $MERGE_STATUS"
+            exit $MERGE_STATUS
+          fi
+
+          echo "✅ Split completed successfully (Exit status: ${MERGE_STATUS:-0})"
           rm -f "source_input.mkv"
           ls -lh part-*.mkv
 
