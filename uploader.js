@@ -1,5 +1,6 @@
 import fs from "fs";
 import https from "https";
+import { execSync } from "child_process";
 
 const API_BASE = "https://www.udrop.com/api/v2";
 
@@ -16,11 +17,24 @@ if (ACCOUNTS.length === 0) {
   process.exit(1);
 }
 
-// Persistent agent with long timeout for multi-gigabyte uploads
 const httpsAgent = new https.Agent({
   keepAlive: true,
   timeout: 180000
 });
+
+// Extract exact playback duration in seconds using ffprobe
+function getMediaDuration(filePath) {
+  try {
+    const stdout = execSync(
+      `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${filePath}"`
+    );
+    const parsed = parseFloat(stdout.toString().trim());
+    return isNaN(parsed) ? 0 : parsed;
+  } catch (err) {
+    console.warn(`   ⚠️ Warning: Could not probe duration for ${filePath}: ${err.message}`);
+    return 0;
+  }
+}
 
 async function authorize(key1, key2) {
   const res = await fetch(`${API_BASE}/authorize`, {
@@ -51,7 +65,7 @@ async function getFreeSpace(token, accountId) {
       return Math.max(0, total - used);
     }
   } catch (err) {
-    console.warn(`Storage query warning: ${err.message}`);
+    console.warn(`Storage check warning: ${err.message}`);
   }
   return 100 * 1024 * 1024 * 1024;
 }
@@ -62,7 +76,7 @@ function uploadStream(filePath, fileName, token, accountId) {
     const stats = fs.statSync(filePath);
     const totalSize = stats.size;
 
-    // upload_file is the exact parameter name required by uDrop API v2
+    // Required parameter name: upload_file
     const head = [
       `--${boundary}`,
       `Content-Disposition: form-data; name="access_token"`,
@@ -110,7 +124,7 @@ function uploadStream(filePath, fileName, token, accountId) {
     req.on("error", reject);
     req.write(head);
 
-    // 128KB chunks with explicit backpressure pacing
+    // 128KB buffer chunks with 10ms pacing delay
     const fileStream = fs.createReadStream(filePath, { highWaterMark: 128 * 1024 });
     let uploadedBytes = 0;
     let lastReport = 0;
@@ -130,7 +144,6 @@ function uploadStream(filePath, fileName, token, accountId) {
         lastReport = now;
       }
 
-      // 10ms pacing delay allows remote proxy buffers to drain smoothly
       if (!canContinue) {
         req.once("drain", () => setTimeout(() => fileStream.resume(), 10));
       } else {
@@ -161,6 +174,7 @@ async function run() {
     process.exit(1);
   }
 
+  // 1. Authenticate and retrieve available capacity across accounts
   const pool = [];
   for (const acc of ACCOUNTS) {
     try {
@@ -181,7 +195,9 @@ async function run() {
 
   const isMultiPart = files.length > 1;
   let partIndex = 1;
+  const uploadedRecords = [];
 
+  // 2. Process each segment
   for (const file of files) {
     const stats = fs.statSync(file);
     const fileSize = stats.size;
@@ -189,9 +205,11 @@ async function run() {
       ? `${baseName}.Part${partIndex}.mkv` 
       : `${baseName}.mkv`;
 
-    console.log(`\n📦 Processing: ${targetName} (${(fileSize / (1024 ** 3)).toFixed(2)} GB)`);
+    console.log(`\n📦 Probing & preparing: ${targetName} (${(fileSize / (1024 ** 3)).toFixed(2)} GB)`);
+    
+    const duration = getMediaDuration(file);
+    console.log(`   ⏱️ Segment duration: ${duration.toFixed(2)} seconds`);
 
-    // Reserve file size + 200MB safety margin
     const targetAcc = pool.find(acc => acc.freeBytes > (fileSize + 200 * 1024 * 1024));
     if (!targetAcc) {
       console.error(`❌ Out of storage! No account has enough space for ${targetName}`);
@@ -200,11 +218,10 @@ async function run() {
 
     console.log(`🚀 Uploading to [${targetAcc.name}]...`);
 
-    let uploaded = false;
+    let uploadResult = null;
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        await uploadStream(file, targetName, targetAcc.token, targetAcc.accountId);
-        uploaded = true;
+        uploadResult = await uploadStream(file, targetName, targetAcc.token, targetAcc.accountId);
         console.log(`✅ Upload complete for ${targetName}!`);
         break;
       } catch (err) {
@@ -213,16 +230,33 @@ async function run() {
       }
     }
 
-    if (!uploaded) {
+    if (!uploadResult) {
       console.error(`❌ Failed to upload ${targetName} after 3 attempts.`);
       process.exit(1);
     }
+
+    // Extract public file URL from Yetishare API response
+    const fileUrl = uploadResult.data?.url || uploadResult.data?.file_url || uploadResult.data?.download_url;
+    console.log(`   🔗 Direct Landing URL: ${fileUrl}`);
+
+    uploadedRecords.push({
+      name: "uDrop",
+      title: baseName,
+      url: fileUrl,
+      filename: targetName,
+      duration: parseFloat(duration.toFixed(3)),
+      size: fileSize
+    });
 
     targetAcc.freeBytes -= fileSize;
     partIndex++;
   }
 
-  console.log("\n🎉 All chunks successfully uploaded and distributed!");
+  // 3. Save records to output file for database.json sync workflows
+  fs.writeFileSync("uploaded_records.json", JSON.stringify(uploadedRecords, null, 2));
+
+  console.log("\n🎉 All segments uploaded and metadata saved to uploaded_records.json!");
+  console.log(JSON.stringify(uploadedRecords, null, 2));
 }
 
 run();
