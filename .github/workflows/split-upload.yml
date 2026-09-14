@@ -26,21 +26,25 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install MKVToolNix
+      - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y mkvtoolnix curl
+          sudo apt-get install -y mkvtoolnix aria2
 
-      - name: Download Large File
+      - name: High-Speed Multi-Connection Download (aria2c)
         run: |
-          echo "Downloading source file..."
-          curl -L -o "source_input.mkv" "${{ inputs.file_url }}"
+          echo "Starting multi-connection download..."
+          aria2c -x 16 -s 16 -k 1M \
+            --file-allocation=none \
+            --summary-interval=5 \
+            -o "source_input.mkv" \
+            "${{ inputs.file_url }}"
 
       - name: Split File into Playable Segments (<4.7GB)
         run: |
-          # Slices file cleanly into standalone MKVs
+          echo "Splitting media losslessly..."
           mkvmerge -o "part-%02d.mkv" --split size:4700M "source_input.mkv"
-          rm "source_input.mkv"
+          rm -f "source_input.mkv"
           ls -lh part-*.mkv
 
       - name: Distribute Chunks Across Accounts
