@@ -12,10 +12,11 @@ try {
 }
 
 if (ACCOUNTS.length === 0) {
-  console.error("❌ No accounts found in UDROP_ACCOUNTS_JSON.");
+  console.error("❌ No accounts configured in UDROP_ACCOUNTS_JSON.");
   process.exit(1);
 }
 
+// Persistent agent with long timeout for multi-gigabyte uploads
 const httpsAgent = new https.Agent({
   keepAlive: true,
   timeout: 180000
@@ -46,7 +47,7 @@ async function getFreeSpace(token, accountId) {
     if (data._status === "success" && data.data) {
       const total = Number(data.data.total_storage_bytes || data.data.max_storage_bytes || 0);
       const used = Number(data.data.storage_used_bytes || data.data.total_storage_used || 0);
-      if (total === 0) return 500 * 1024 * 1024 * 1024;
+      if (total === 0) return 500 * 1024 * 1024 * 1024; // Unmetered
       return Math.max(0, total - used);
     }
   } catch (err) {
@@ -61,7 +62,7 @@ function uploadStream(filePath, fileName, token, accountId) {
     const stats = fs.statSync(filePath);
     const totalSize = stats.size;
 
-    // upload_file is the official parameter name documented on udrop.com/api
+    // upload_file is the exact parameter name required by uDrop API v2
     const head = [
       `--${boundary}`,
       `Content-Disposition: form-data; name="access_token"`,
@@ -109,6 +110,7 @@ function uploadStream(filePath, fileName, token, accountId) {
     req.on("error", reject);
     req.write(head);
 
+    // 128KB chunks with explicit backpressure pacing
     const fileStream = fs.createReadStream(filePath, { highWaterMark: 128 * 1024 });
     let uploadedBytes = 0;
     let lastReport = 0;
@@ -128,6 +130,7 @@ function uploadStream(filePath, fileName, token, accountId) {
         lastReport = now;
       }
 
+      // 10ms pacing delay allows remote proxy buffers to drain smoothly
       if (!canContinue) {
         req.once("drain", () => setTimeout(() => fileStream.resume(), 10));
       } else {
@@ -188,6 +191,7 @@ async function run() {
 
     console.log(`\n📦 Processing: ${targetName} (${(fileSize / (1024 ** 3)).toFixed(2)} GB)`);
 
+    // Reserve file size + 200MB safety margin
     const targetAcc = pool.find(acc => acc.freeBytes > (fileSize + 200 * 1024 * 1024));
     if (!targetAcc) {
       console.error(`❌ Out of storage! No account has enough space for ${targetName}`);
