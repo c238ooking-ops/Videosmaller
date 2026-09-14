@@ -47,7 +47,6 @@ async function getFreeSpace(token, accountId) {
   return 10 * 1024 * 1024 * 1024;
 }
 
-// Streams 4.7GB+ straight from filesystem into the HTTP request (prevents OOM crash)
 function uploadStream(filePath, fileName, token, accountId) {
   return new Promise((resolve, reject) => {
     const boundary = "----WebKitFormBoundary" + Math.random().toString(36).substring(2);
@@ -98,7 +97,6 @@ function uploadStream(filePath, fileName, token, accountId) {
 
     req.on("error", reject);
 
-    // Track upload progress
     let uploadedBytes = 0;
     let lastReport = 0;
     const fileStream = fs.createReadStream(filePath);
@@ -108,7 +106,7 @@ function uploadStream(filePath, fileName, token, accountId) {
     fileStream.on("data", (chunk) => {
       uploadedBytes += chunk.length;
       const now = Date.now();
-      if (now - lastReport > 4000) { // Log every 4s
+      if (now - lastReport > 4000) {
         const pct = ((uploadedBytes / totalSize) * 100).toFixed(1);
         const mb = (uploadedBytes / (1024 * 1024)).toFixed(0);
         const totalMb = (totalSize / (1024 * 1024)).toFixed(0);
@@ -136,7 +134,7 @@ async function run() {
     .sort();
 
   if (files.length === 0) {
-    console.error("❌ No part files found to upload.");
+    console.error("❌ No split files found to upload.");
     process.exit(1);
   }
 
@@ -158,11 +156,17 @@ async function run() {
     process.exit(1);
   }
 
+  const isMultiPart = files.length > 1;
   let partIndex = 1;
+
   for (const file of files) {
     const stats = fs.statSync(file);
     const fileSize = stats.size;
-    const targetName = `${baseName}.Part${partIndex}.mkv`;
+    
+    // Naming logic: only append .PartX if the file was actually sliced into >1 piece
+    const targetName = isMultiPart 
+      ? `${baseName}.Part${partIndex}.mkv` 
+      : `${baseName}.mkv`;
 
     console.log(`\n📦 Processing: ${targetName} (${(fileSize / (1024 ** 3)).toFixed(2)} GB)`);
 
