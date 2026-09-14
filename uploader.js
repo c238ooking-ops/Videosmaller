@@ -16,12 +16,13 @@ if (ACCOUNTS.length === 0) {
   process.exit(1);
 }
 
-// Persistent agent prevents sudden TLS handshake timeouts
+// Keep-alive agent to maintain persistent TLS socket
 const httpsAgent = new https.Agent({
   keepAlive: true,
-  timeout: 60000
+  timeout: 180000
 });
 
+// 1. Authorize API v2
 async function authorize(key1, key2) {
   const res = await fetch(`${API_BASE}/authorize`, {
     method: "POST",
@@ -29,30 +30,38 @@ async function authorize(key1, key2) {
     body: new URLSearchParams({ key1, key2 })
   });
   const data = await res.json();
-  if (data._status !== "success") throw new Error(`Auth failed: ${data.response}`);
+  if (data._status !== "success") {
+    throw new Error(`Auth failed: ${data.response || JSON.stringify(data)}`);
+  }
   return { token: data.data.access_token, accountId: data.data.account_id };
 }
 
+// 2. Exact account storage endpoint according to API docs (/account/package)
 async function getFreeSpace(token, accountId) {
   try {
-    const res = await fetch(`${API_BASE}/account/details`, {
+    const res = await fetch(`${API_BASE}/account/package`, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({ access_token: token, account_id: accountId })
     });
     const data = await res.json();
+
     if (data._status === "success" && data.data) {
-      const total = Number(data.data.total_storage_bytes || data.data.storage_limit_bytes || 0);
-      const used = Number(data.data.used_storage_bytes || data.data.storage_used_bytes || 0);
-      if (total === 0) return 100 * 1024 * 1024 * 1024;
+      const total = Number(data.data.total_storage_bytes || data.data.max_storage_bytes || 0);
+      const used = Number(data.data.storage_used_bytes || data.data.total_storage_used || 0);
+
+      // 0 represents unmetered/unlimited storage
+      if (total === 0) return 500 * 1024 * 1024 * 1024;
       return Math.max(0, total - used);
     }
   } catch (err) {
-    console.warn(`Could not check space: ${err.message}`);
+    console.warn(`Storage query warning: ${err.message}`);
   }
-  return 10 * 1024 * 1024 * 1024;
+  // Safe default fallback
+  return 100 * 1024 * 1024 * 1024;
 }
 
+// 3. Multi-gigabyte safe streaming uploader with rate-pacing
 function uploadStream(filePath, fileName, token, accountId) {
   return new Promise((resolve, reject) => {
     const boundary = "----WebKitFormBoundary" + Math.random().toString(36).substring(2);
@@ -69,7 +78,7 @@ function uploadStream(filePath, fileName, token, accountId) {
       "",
       accountId,
       `--${boundary}`,
-      `Content-Disposition: form-data; name="files"; filename="${fileName}"`,
+      `Content-Disposition: form-data; name="files[]"; filename="${fileName}"`,
       "Content-Type: video/x-matroska",
       "",
       ""
@@ -95,26 +104,28 @@ function uploadStream(filePath, fileName, token, accountId) {
           if (data._status === "success") {
             resolve(data);
           } else {
-            reject(new Error(data.response || "Upload rejected"));
+            reject(new Error(data.response || JSON.stringify(data)));
           }
         } catch (e) {
-          reject(new Error(`Invalid response: ${body.substring(0, 200)}`));
+          reject(new Error(`Invalid server response: ${body.substring(0, 300)}`));
         }
       });
     });
 
     req.on("error", reject);
+    req.write(head);
 
+    // 128KB buffer chunks with TCP flow control to avoid proxy socket drops
+    const fileStream = fs.createReadStream(filePath, { highWaterMark: 128 * 1024 });
     let uploadedBytes = 0;
     let lastReport = 0;
-    
-    // 64KB highWaterMark chunks provide smooth backpressure
-    const fileStream = fs.createReadStream(filePath, { highWaterMark: 64 * 1024 });
-
-    req.write(head);
 
     fileStream.on("data", (chunk) => {
       uploadedBytes += chunk.length;
+      fileStream.pause();
+
+      const canContinue = req.write(chunk);
+
       const now = Date.now();
       if (now - lastReport > 3000) {
         const pct = ((uploadedBytes / totalSize) * 100).toFixed(1);
@@ -122,6 +133,13 @@ function uploadStream(filePath, fileName, token, accountId) {
         const totalMb = (totalSize / (1024 * 1024)).toFixed(0);
         console.log(`   ⏳ Transferred: ${mb}MB / ${totalMb}MB (${pct}%)`);
         lastReport = now;
+      }
+
+      // Allow TCP socket buffers to drain smoothly
+      if (!canContinue) {
+        req.once("drain", () => setTimeout(() => fileStream.resume(), 10));
+      } else {
+        setTimeout(() => fileStream.resume(), 10);
       }
     });
 
@@ -137,6 +155,7 @@ function uploadStream(filePath, fileName, token, accountId) {
   });
 }
 
+// 4. Main distribution runner
 async function run() {
   const baseName = process.env.BASE_NAME || "Video";
   const files = fs.readdirSync(".")
@@ -151,7 +170,7 @@ async function run() {
   const pool = [];
   for (const acc of ACCOUNTS) {
     try {
-      console.log(`🔑 Checking account: [${acc.name}]...`);
+      console.log(`🔑 Authenticating & checking storage: [${acc.name}]...`);
       const auth = await authorize(acc.key1, acc.key2);
       const freeBytes = await getFreeSpace(auth.token, auth.accountId);
       console.log(`   Available space: ${(freeBytes / (1024 ** 3)).toFixed(2)} GB`);
@@ -178,9 +197,10 @@ async function run() {
 
     console.log(`\n📦 Processing: ${targetName} (${(fileSize / (1024 ** 3)).toFixed(2)} GB)`);
 
+    // Target account requires chunk size + 200MB safety buffer
     const targetAcc = pool.find(acc => acc.freeBytes > (fileSize + 200 * 1024 * 1024));
     if (!targetAcc) {
-      console.error(`❌ Out of storage! None of your accounts have enough free space for ${targetName}`);
+      console.error(`❌ Out of storage! No account has enough space for ${targetName}`);
       process.exit(1);
     }
 
@@ -208,7 +228,7 @@ async function run() {
     partIndex++;
   }
 
-  console.log("\n🎉 All chunks successfully processed and uploaded!");
+  console.log("\n🎉 All chunks successfully uploaded and distributed!");
 }
 
 run();
