@@ -16,6 +16,12 @@ if (ACCOUNTS.length === 0) {
   process.exit(1);
 }
 
+// Persistent agent prevents sudden TLS handshake timeouts
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  timeout: 60000
+});
+
 async function authorize(key1, key2) {
   const res = await fetch(`${API_BASE}/authorize`, {
     method: "POST",
@@ -74,9 +80,11 @@ function uploadStream(filePath, fileName, token, accountId) {
 
     const req = https.request("https://www.udrop.com/api/v2/file/upload", {
       method: "POST",
+      agent: httpsAgent,
       headers: {
         "Content-Type": `multipart/form-data; boundary=${boundary}`,
-        "Content-Length": contentLength
+        "Content-Length": contentLength,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
       }
     }, (res) => {
       let body = "";
@@ -99,14 +107,16 @@ function uploadStream(filePath, fileName, token, accountId) {
 
     let uploadedBytes = 0;
     let lastReport = 0;
-    const fileStream = fs.createReadStream(filePath);
+    
+    // 64KB highWaterMark chunks provide smooth backpressure
+    const fileStream = fs.createReadStream(filePath, { highWaterMark: 64 * 1024 });
 
     req.write(head);
 
     fileStream.on("data", (chunk) => {
       uploadedBytes += chunk.length;
       const now = Date.now();
-      if (now - lastReport > 4000) {
+      if (now - lastReport > 3000) {
         const pct = ((uploadedBytes / totalSize) * 100).toFixed(1);
         const mb = (uploadedBytes / (1024 * 1024)).toFixed(0);
         const totalMb = (totalSize / (1024 * 1024)).toFixed(0);
@@ -162,8 +172,6 @@ async function run() {
   for (const file of files) {
     const stats = fs.statSync(file);
     const fileSize = stats.size;
-    
-    // Naming logic: only append .PartX if the file was actually sliced into >1 piece
     const targetName = isMultiPart 
       ? `${baseName}.Part${partIndex}.mkv` 
       : `${baseName}.mkv`;
@@ -177,8 +185,24 @@ async function run() {
     }
 
     console.log(`🚀 Uploading to [${targetAcc.name}]...`);
-    await uploadStream(file, targetName, targetAcc.token, targetAcc.accountId);
-    console.log(`✅ Upload complete for ${targetName}!`);
+
+    let uploaded = false;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await uploadStream(file, targetName, targetAcc.token, targetAcc.accountId);
+        uploaded = true;
+        console.log(`✅ Upload complete for ${targetName}!`);
+        break;
+      } catch (err) {
+        console.warn(`   ⚠️ Attempt ${attempt} failed (${err.message}). Retrying in 5s...`);
+        await new Promise((r) => setTimeout(r, 5000));
+      }
+    }
+
+    if (!uploaded) {
+      console.error(`❌ Failed to upload ${targetName} after 3 attempts.`);
+      process.exit(1);
+    }
 
     targetAcc.freeBytes -= fileSize;
     partIndex++;
