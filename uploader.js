@@ -69,7 +69,7 @@ async function getFreeSpace(token, accountId) {
   return 100 * 1024 * 1024 * 1024;
 }
 
-// --- EXACT FOLDER RESOLUTION & PUBLIC VISIBILITY MATCHING ZIP WORKFLOW ---
+// --- FIXED: Uses String() instead of Python's str() ---
 async function getOrCreateFolder(token, accountId, folderName, parentId = null) {
   try {
     const listParams = new URLSearchParams({ access_token: token, account_id: accountId });
@@ -86,13 +86,13 @@ async function getOrCreateFolder(token, accountId, folderName, parentId = null) 
       const foldersList = listData.data.folders || listData.data;
       if (Array.isArray(foldersList)) {
         const existing = foldersList.find(f => 
-          f.status !== "trash" && str(f.folderName || "").trim().toLowerCase() === folderName.trim().toLowerCase()
+          f.status !== "trash" && String(f.folderName || "").trim().toLowerCase() === folderName.trim().toLowerCase()
         );
         if (existing) return String(existing.id);
       }
     }
 
-    // Create folder with public visibility ("is_public": 1) just like your zip uploader
+    // Create folder with public visibility ("is_public": "1")
     const createParams = new URLSearchParams({
       access_token: token,
       account_id: accountId,
@@ -227,14 +227,12 @@ async function run() {
   const baseName = process.env.BASE_NAME || "Video";
   const targetFolderId = process.env.TARGET_FOLDER_ID || "";
 
-  // Scan root directory directly for time-split or size-split chunks (part-*.ts, part-*.mkv)
   const files = fs.readdirSync(".")
     .filter(f => f.startsWith("part-") && (f.endsWith(".ts") || f.endsWith(".mkv")))
     .sort();
 
   if (files.length === 0) {
-    console.error("❌ No split parts found in root directory. Checking alternative paths...");
-    // Fallback search if files are inside a directory
+    console.error("❌ No split parts found in root directory.");
     process.exit(1);
   }
 
@@ -280,7 +278,6 @@ async function run() {
       process.exit(1);
     }
 
-    // Ensure the folder is created publicly on the fly matching the zip uploader logic
     if (!targetAcc.activeFolderId) {
       console.log(`   📁 Ensuring public folder "${baseName}" exists in [${targetAcc.name}]...`);
       targetAcc.activeFolderId = await getOrCreateFolder(targetAcc.token, targetAcc.accountId, baseName, targetFolderId);
@@ -325,7 +322,6 @@ async function run() {
 
   fs.writeFileSync("uploaded_records.json", JSON.stringify(uploadedRecords, null, 2));
 
-  // --- MERGE INTO DATABASE.JSON & SYNC TO CLOUDFLARE WORKER ---
   let db = {};
   if (fs.existsSync("database.json")) {
     try {
