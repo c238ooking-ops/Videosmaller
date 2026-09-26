@@ -69,7 +69,7 @@ async function getFreeSpace(token, accountId) {
   return 100 * 1024 * 1024 * 1024;
 }
 
-function uploadStream(filePath, fileName, token, accountId) {
+function uploadStream(filePath, fileName, token, accountId, folderId) {
   return new Promise((resolve, reject) => {
     const boundary = "----WebKitFormBoundary" + Math.random().toString(36).substring(2);
     const stats = fs.statSync(filePath);
@@ -77,7 +77,7 @@ function uploadStream(filePath, fileName, token, accountId) {
     const isMpegTs = fileName.endsWith(".ts");
     const mimeType = isMpegTs ? "video/mp2t" : "application/octet-stream";
 
-    const head = [
+    let headParts = [
       `--${boundary}`,
       `Content-Disposition: form-data; name="access_token"`,
       "",
@@ -85,14 +85,27 @@ function uploadStream(filePath, fileName, token, accountId) {
       `--${boundary}`,
       `Content-Disposition: form-data; name="account_id"`,
       "",
-      accountId,
+      accountId
+    ];
+
+    if (folderId) {
+      headParts.push(
+        `--${boundary}`,
+        `Content-Disposition: form-data; name="folder_id"`,
+        "",
+        folderId
+      );
+    }
+
+    headParts.push(
       `--${boundary}`,
       `Content-Disposition: form-data; name="upload_file"; filename="${fileName}"`,
       `Content-Type: ${mimeType}`,
       "",
       ""
-    ].join("\r\n");
+    );
 
+    const head = headParts.join("\r\n");
     const tail = `\r\n--${boundary}--\r\n`;
     const contentLength = Buffer.byteLength(head) + totalSize + Buffer.byteLength(tail);
 
@@ -164,6 +177,66 @@ function uploadStream(filePath, fileName, token, accountId) {
 
 async function run() {
   const baseName = process.env.BASE_NAME || "Video";
+  const targetFolderId = process.env.TARGET_FOLDER_ID || "";
+  const downloadFilename = "downloaded_payload";
+
+  // Check if file needs splitting (Size-based splitting logic targeting ~2.5 GB per part)
+  const MAX_UDROP_BYTES = 5 * 1024 * 1024 * 1024; // 5.0 GB limit
+  
+  if (fs.existsSync(downloadFilename)) {
+    const downloadedSize = fs.statSync(downloadFilename).size;
+    
+    if (downloadedSize > MAX_UDROP_BYTES) {
+      console.log(`📦 File size (${(downloadedSize / (1024**3)).toFixed(2)} GB) exceeds uDrop 5GB limit.`);
+      console.log(`✂️ Splitting file by size into ~2.5 GB chunks (preserving all audio tracks & subtitles)...`);
+      
+      os.makedirs("ready_to_upload", { recursive: true });
+      const chunkSizeLimit = Math.floor(2.5 * 1024 * 1024 * 1024); // 2.5 GB per chunk limit (-fs)
+      
+      try {
+        const probeCmd = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${downloadFilename}"`;
+        const totalDuration = parseFloat(execSync(probeCmd).toString().trim()) || 0;
+        
+        let currentTime = 0;
+        let partIdx = 0;
+        
+        while (currentTime < totalDuration) {
+          const outputPart = `part-${String(partIdx).padStart(2, '0')}.ts`;
+          
+          // -map 0 keeps all audio/subtitles, -c copy avoids re-encoding, -fs limits output size
+          const splitCmd = `ffmpeg -y -ss ${currentTime} -i "${downloadFilename}" -map 0 -c keyword -c copy -fs ${chunkSizeLimit} "${outputPart}"`;
+          // Corrected command without typo:
+          const cleanSplitCmd = `ffmpeg -y -ss ${currentTime} -i "${downloadFilename}" -map 0 -c copy -fs ${chunkSizeLimit} "${outputPart}"`;
+          
+          execSync(cleanSplitCmd, { stdio: 'inherit' });
+          
+          if (!fs.existsSync(outputPart) || fs.statSync(outputPart).size === 0) {
+            break;
+          }
+          
+          const partDurCmd = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${outputPart}"`;
+          const partDurStr = execSync(partDurCmd).toString().trim();
+          const partDuration = parseFloat(partDurStr);
+          
+          if (isNaN(partDuration) || partDuration <= 0) break;
+          
+          currentTime += partDuration;
+          partIdx++;
+        }
+        
+        fs.unlinkSync(downloadFilename);
+        console.log(`✅ Successfully split large file into ${partIdx} parts by size.`);
+      } catch (err) {
+        console.error(`❌ Size-based splitting failed: ${err.message}`);
+        process.exit(1);
+      }
+    } else {
+      // Small enough, just rename to extension if needed
+      if (!fs.existsSync("part-00.ts") && !fs.existsSync("part-00.mkv")) {
+        fs.renameSync(downloadFilename, "part-00.ts");
+      }
+    }
+  }
 
   const files = fs.readdirSync(".")
     .filter(f => f.startsWith("part-") && (f.endsWith(".ts") || f.endsWith(".mkv")))
@@ -221,7 +294,7 @@ async function run() {
     let uploadResult = null;
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        uploadResult = await uploadStream(file, targetName, targetAcc.token, targetAcc.accountId);
+        uploadResult = await uploadStream(file, targetName, targetAcc.token, targetAcc.accountId, targetFolderId);
         console.log(`✅ Upload complete for ${targetName}!`);
         break;
       } catch (err) {
