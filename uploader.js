@@ -180,7 +180,6 @@ async function run() {
   const targetFolderId = process.env.TARGET_FOLDER_ID || "";
   const downloadFilename = "downloaded_payload";
 
-  // Check if file needs splitting (Size-based splitting logic targeting ~2.5 GB per part)
   const MAX_UDROP_BYTES = 5 * 1024 * 1024 * 1024; // 5.0 GB limit
   
   if (fs.existsSync(downloadFilename)) {
@@ -190,7 +189,8 @@ async function run() {
       console.log(`📦 File size (${(downloadedSize / (1024**3)).toFixed(2)} GB) exceeds uDrop 5GB limit.`);
       console.log(`✂️ Splitting file by size into ~2.5 GB chunks (preserving all audio tracks & subtitles)...`);
       
-      os.makedirs("ready_to_upload", { recursive: true });
+      // Fixed: Using fs.mkdirSync instead of os.makedirs
+      fs.mkdirSync("ready_to_upload", { recursive: true });
       const chunkSizeLimit = Math.floor(2.5 * 1024 * 1024 * 1024); // 2.5 GB per chunk limit (-fs)
       
       try {
@@ -201,13 +201,9 @@ async function run() {
         let partIdx = 0;
         
         while (currentTime < totalDuration) {
-          const outputPart = `part-${String(partIdx).padStart(2, '0')}.ts`;
+          const outputPart = `ready_to_upload/part-${String(partIdx).padStart(2, '0')}.ts`;
           
-          // -map 0 keeps all audio/subtitles, -c copy avoids re-encoding, -fs limits output size
-          const splitCmd = `ffmpeg -y -ss ${currentTime} -i "${downloadFilename}" -map 0 -c keyword -c copy -fs ${chunkSizeLimit} "${outputPart}"`;
-          // Corrected command without typo:
           const cleanSplitCmd = `ffmpeg -y -ss ${currentTime} -i "${downloadFilename}" -map 0 -c copy -fs ${chunkSizeLimit} "${outputPart}"`;
-          
           execSync(cleanSplitCmd, { stdio: 'inherit' });
           
           if (!fs.existsSync(outputPart) || fs.statSync(outputPart).size === 0) {
@@ -231,16 +227,16 @@ async function run() {
         process.exit(1);
       }
     } else {
-      // Small enough, just rename to extension if needed
-      if (!fs.existsSync("part-00.ts") && !fs.existsSync("part-00.mkv")) {
-        fs.renameSync(downloadFilename, "part-00.ts");
-      }
+      fs.mkdirSync("ready_to_upload", { recursive: true });
+      const ext = downloadFilename.endsWith(".mkv") ? ".mkv" : ".ts";
+      fs.renameSync(downloadFilename, `ready_to_upload/part-00${ext}`);
     }
   }
 
-  const files = fs.readdirSync(".")
+  const files = fs.readdirSync("ready_to_upload")
     .filter(f => f.startsWith("part-") && (f.endsWith(".ts") || f.endsWith(".mkv")))
-    .sort();
+    .sort()
+    .map(f => `ready_to_upload/${f}`);
 
   if (files.length === 0) {
     console.error("❌ No split parts (part-*.ts or part-*.mkv) found to upload.");
