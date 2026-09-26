@@ -312,7 +312,7 @@ async function run() {
       title: baseName,
       url: fileUrl,
       filename: targetName,
-      duration: parseFloat(duration.toFixed(3)),
+      duration: parseFloat(duration.toFixed(3)), // Ensure this is sent!
       size: fileSize
     });
 
