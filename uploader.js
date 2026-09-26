@@ -178,68 +178,14 @@ function uploadStream(filePath, fileName, token, accountId, folderId) {
 async function run() {
   const baseName = process.env.BASE_NAME || "Video";
   const targetFolderId = process.env.TARGET_FOLDER_ID || "";
-  const downloadFilename = "downloaded_payload";
 
-  const MAX_UDROP_BYTES = 5 * 1024 * 1024 * 1024; // 5.0 GB limit
-  
-  if (fs.existsSync(downloadFilename)) {
-    const downloadedSize = fs.statSync(downloadFilename).size;
-    
-    if (downloadedSize > MAX_UDROP_BYTES) {
-      console.log(`📦 File size (${(downloadedSize / (1024**3)).toFixed(2)} GB) exceeds uDrop 5GB limit.`);
-      console.log(`✂️ Splitting file by size into ~2.5 GB chunks (preserving all audio tracks & subtitles)...`);
-      
-      // Fixed: Using fs.mkdirSync instead of os.makedirs
-      fs.mkdirSync("ready_to_upload", { recursive: true });
-      const chunkSizeLimit = Math.floor(2.5 * 1024 * 1024 * 1024); // 2.5 GB per chunk limit (-fs)
-      
-      try {
-        const probeCmd = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${downloadFilename}"`;
-        const totalDuration = parseFloat(execSync(probeCmd).toString().trim()) || 0;
-        
-        let currentTime = 0;
-        let partIdx = 0;
-        
-        while (currentTime < totalDuration) {
-          const outputPart = `ready_to_upload/part-${String(partIdx).padStart(2, '0')}.ts`;
-          
-          const cleanSplitCmd = `ffmpeg -y -ss ${currentTime} -i "${downloadFilename}" -map 0 -c copy -fs ${chunkSizeLimit} "${outputPart}"`;
-          execSync(cleanSplitCmd, { stdio: 'inherit' });
-          
-          if (!fs.existsSync(outputPart) || fs.statSync(outputPart).size === 0) {
-            break;
-          }
-          
-          const partDurCmd = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${outputPart}"`;
-          const partDurStr = execSync(partDurCmd).toString().trim();
-          const partDuration = parseFloat(partDurStr);
-          
-          if (isNaN(partDuration) || partDuration <= 0) break;
-          
-          currentTime += partDuration;
-          partIdx++;
-        }
-        
-        fs.unlinkSync(downloadFilename);
-        console.log(`✅ Successfully split large file into ${partIdx} parts by size.`);
-      } catch (err) {
-        console.error(`❌ Size-based splitting failed: ${err.message}`);
-        process.exit(1);
-      }
-    } else {
-      fs.mkdirSync("ready_to_upload", { recursive: true });
-      const ext = downloadFilename.endsWith(".mkv") ? ".mkv" : ".ts";
-      fs.renameSync(downloadFilename, `ready_to_upload/part-00${ext}`);
-    }
-  }
-
-  const files = fs.readdirSync("ready_to_upload")
+  // Scan root directory directly for time-split chunks (part-00.ts, part-01.ts, etc.)
+  const files = fs.readdirSync(".")
     .filter(f => f.startsWith("part-") && (f.endsWith(".ts") || f.endsWith(".mkv")))
-    .sort()
-    .map(f => `ready_to_upload/${f}`);
+    .sort();
 
   if (files.length === 0) {
-    console.error("❌ No split parts (part-*.ts or part-*.mkv) found to upload.");
+    console.error("❌ No split parts (part-*.ts or part-*.mkv) found in root directory to upload.");
     process.exit(1);
   }
 
@@ -312,7 +258,7 @@ async function run() {
       title: baseName,
       url: fileUrl,
       filename: targetName,
-      duration: parseFloat(duration.toFixed(3)), // Ensure this is sent!
+      duration: parseFloat(duration.toFixed(3)),
       size: fileSize
     });
 
