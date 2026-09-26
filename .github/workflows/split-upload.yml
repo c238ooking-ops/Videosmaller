@@ -1,75 +1,206 @@
-name: Remote Split & Multi-Account Upload
+name: Unzip & Upload to uDrop
 
 on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: 'Direct HTTPS URL to the video'
+        description: 'Direct HTTPS URL (Skydrop, Pixeldrain, R2, etc.)'
         required: true
-      file_name:
-        description: 'Target Base Name (e.g. Spider-Man.2.2004.1080p)'
+      base_name:
+        description: 'Base Media Name (e.g. Movie.Name.2026.1080p)'
         required: true
+        default: 'Video'
+      account_number:
+        description: 'Account Number in JSON list (e.g. 1, 2, 3)'
+        required: true
+        default: '1'
+      folder_path:
+        description: 'Folder Path (e.g. "m2/movies"; leave blank for root)'
+        required: false
+        default: ''
 
 permissions:
   contents: read
 
 jobs:
-  split_and_upload:
+  unzip_and_upload:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Free Up Disk Space
+      - name: Free Up Runner Disk Space
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf "/usr/local/share/boost"
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet /opt/ghc "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY" /usr/local/lib/android
 
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: '20'
 
-      - name: Cache APT Packages
+      - name: Cache Playwright Browsers
         uses: actions/cache@v4
+        id: playwright-cache
         with:
-          path: /var/cache/apt/archives
-          key: apt-media-tools-${{ runner.os }}
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-chromium-v1
+          restore-keys: |
+            ${{ runner.os }}-playwright-chromium-
 
-      - name: Install System Tools (FFmpeg, MKVToolNix, Aria2)
+      - name: Install System Tools & Dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg mkvtoolnix aria2
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends aria2 wget curl ffmpeg
+          pip install --no-cache-dir requests requests-toolbelt yt-dlp playwright
 
-      - name: High-Speed Multi-Connection Download (aria2c)
+      - name: Install Playwright Browser (Conditional)
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: |
-          echo "Downloading source file via 16 parallel sockets..."
-          aria2c -x 16 -s 16 -k 1M \
-            --file-allocation=none \
-            --summary-interval=5 \
-            -o "source_input.mkv" \
-            "${{ inputs.file_url }}"
+          playwright install chromium --with-deps
 
-      - name: Lossless Slice to MPEG-TS (Stream-Concatenation Ready)
+      - name: Download Payload (Python)
+        env:
+          FILE_URL: ${{ inputs.file_url }}
         run: |
-          echo "Slicing lossless MPEG-TS segments (1 hour cuts, <3.8GB safe limit)..."
-          ffmpeg -y -i "source_input.mkv" \
-            -c copy \
-            -map 0:v -map 0:a \
-            -f segment \
-            -segment_time 3600 \
-            -reset_timestamps 0 \
-            "part-%02d.ts"
+          python - << 'EOF'
+          import os
+          import re
+          import asyncio
+          import requests
+          from playwright.async_api import async_playwright
 
-          rm -f "source_input.mkv"
-          ls -lh part-*.ts
+          file_url = os.environ.get("FILE_URL", "").strip()
+          download_filename = "downloaded_payload"
 
-      - name: Distribute Chunks to uDrop Accounts
+          async def download_skydrop(url):
+              print("🌐 Skydrop link detected. Launching automated headless browser...")
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(headless=True)
+                  context = await browser.new_context(accept_downloads=True)
+                  page = await context.new_page()
+                  await page.goto(url, wait_until="networkidle")
+                  try:
+                      download_btn = page.locator("a:has-text('Download Video'), button:has-text('Download Video')")
+                      await download_btn.wait_for(state="visible", timeout=20000)
+                      async with page.expect_download(timeout=60000) as download_info:
+                          await download_btn.first.click()
+                      download = await download_info.value
+                      await download.save_as(download_filename)
+                      print("🎉 Successfully downloaded via Playwright.")
+                  except Exception as e:
+                      raise Exception(f"❌ Playwright download failed: {e}")
+                  finally:
+                      await browser.close()
+
+          download_url = file_url
+          pixeldrain_match = re.search(r'pixeldrain\.(?:dev|com)/u/([a-zA-Z0-9_-]+)', download_url)
+          if pixeldrain_match:
+              download_url = f"https://pixeldrain.com/api/file/{pixeldrain_match.group(1)}"
+
+          if "skydrop" in download_url:
+              asyncio.run(download_skydrop(download_url))
+          else:
+              dl_cmd = f'aria2c -x 16 -s 16 -k 2M --file-allocation=none -o "{download_filename}" "{download_url}"'
+              if os.system(dl_cmd) != 0 or not os.path.exists(download_filename):
+                  raise Exception("❌ Standard download failed.")
+          EOF
+
+      - name: Resolve Folder Path (Python)
+        id: folder-resolver
+        env:
+          ACCOUNT_NUM: ${{ inputs.account_number }}
+          FOLDER_PATH: ${{ inputs.folder_path }}
+          ACCOUNTS_JSON: ${{ secrets.UDROP_ACCOUNTS_JSON }}
+          FALLBACK_KEY1: ${{ secrets.UDROP_KEY1 }}
+          FALLBACK_KEY2: ${{ secrets.UDROP_KEY2 }}
+        run: |
+          python - << 'EOF'
+          import os
+          import json
+          import re
+          import requests
+
+          account_raw_num = os.environ.get("ACCOUNT_NUM", "1").strip()
+          folder_path = os.environ.get("FOLDER_PATH", "").strip()
+          accounts_raw = os.environ.get("ACCOUNTS_JSON", "").strip()
+          API_BASE = "https://www.udrop.com/api/v2"
+
+          key1, key2 = None, None
+          try:
+              target_idx = max(0, int(account_raw_num) - 1)
+          except ValueError:
+              target_idx = 0
+
+          if accounts_raw:
+              try:
+                  acc_data = json.loads(accounts_raw)
+                  if isinstance(acc_data, list) and target_idx < len(acc_data):
+                      selected = acc_data[target_idx]
+                      key1 = selected.get("key1")
+                      key2 = selected.get("key2")
+              except Exception:
+                  pass
+
+          if not key1 or not key2:
+              key1 = os.environ.get("FALLBACK_KEY1")
+              key2 = os.environ.get("FALLBACK_KEY2")
+
+          if not key1 or not key2:
+              raise Exception("❌ Missing API credentials!")
+
+          auth_res = requests.post(f"{API_BASE}/authorize", data={"key1": key1, "key2": key2})
+          auth_data = auth_res.json()
+          if auth_data.get("_status") != "success":
+              raise Exception(f"Auth failed: {auth_data.get('response')}")
+
+          access_token = auth_data["data"]["access_token"]
+          account_id = auth_data["data"]["account_id"]
+
+          target_folder_id = ""
+          if folder_path:
+              if folder_path.strip().isdigit():
+                  target_folder_id = folder_path.strip()
+              else:
+                  segments = [s.strip() for s in re.split(r'[\\/]+', folder_path) if s.strip()]
+                  current_parent_id = ""
+                  for segment in segments:
+                      list_payload = {"access_token": access_token, "account_id": account_id}
+                      if current_parent_id:
+                          list_payload["parent_folder_id"] = str(current_parent_id)
+
+                      listing_res = requests.post(f"{API_BASE}/folder/listing", data=list_payload).json()
+                      folders_list = listing_res.get("data", {}).get("folders", []) if isinstance(listing_res.get("data"), dict) else listing_res.get("data", [])
+
+                      found_id = None
+                      for f in folders_list:
+                          if f.get("status") != "trash" and str(f.get("folderName", "")).strip().lower() == segment.lower():
+                              found_id = str(f.get("id"))
+                              break
+
+                      if not found_id:
+                          create_payload = {"access_token": access_token, "account_id": account_id, "folder_name": segment, "is_public": 1}
+                          if current_parent_id:
+                              create_payload["parent_id"] = str(current_parent_id)
+                          create_res = requests.post(f"{API_BASE}/folder/create", data=create_payload).json()
+                          if create_res.get("_status") == "success" and create_res.get("data"):
+                              found_id = str(create_res["data"].get("id") or create_res["data"].get("folder_id"))
+                      current_parent_id = found_id
+                  target_folder_id = current_parent_id or ""
+
+          print(f"🎯 Target Folder ID: {target_folder_id or 'Root'}")
+          with open(os.environ['GITHUB_ENV'], 'a') as env_file:
+              env_file.write(f"RESOLVED_FOLDER_ID={target_folder_id}\n")
+          EOF
+
+      - name: Run Node.js Uploader Script[cite: 2]
         env:
           UDROP_ACCOUNTS_JSON: ${{ secrets.UDROP_ACCOUNTS_JSON }}
-          BASE_NAME: ${{ inputs.file_name }}
-        run: node uploader.js
+          BASE_NAME: ${{ inputs.base_name }}
+          TARGET_FOLDER_ID: ${{ env.RESOLVED_FOLDER_ID }}
+        run: node uploader.js[cite: 2]
