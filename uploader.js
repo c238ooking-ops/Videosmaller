@@ -69,10 +69,9 @@ async function getFreeSpace(token, accountId) {
   return 100 * 1024 * 1024 * 1024;
 }
 
-// --- NEW FUNCTION: Check for existing folder or create it dynamically ---
+// --- EXACT FOLDER RESOLUTION & PUBLIC VISIBILITY MATCHING ZIP WORKFLOW ---
 async function getOrCreateFolder(token, accountId, folderName, parentId = null) {
   try {
-    // 1. Check if folder already exists
     const listParams = new URLSearchParams({ access_token: token, account_id: accountId });
     if (parentId) listParams.append("parent_folder_id", parentId);
     
@@ -83,13 +82,23 @@ async function getOrCreateFolder(token, accountId, folderName, parentId = null) 
     });
     const listData = await listRes.json();
     
-    if (listData._status === "success" && listData.data && listData.data.folders) {
-      const existing = listData.data.folders.find(f => f.folderName.toLowerCase() === folderName.toLowerCase());
-      if (existing) return existing.id; // Return existing folder ID
+    if (listData._status === "success" && listData.data) {
+      const foldersList = listData.data.folders || listData.data;
+      if (Array.isArray(foldersList)) {
+        const existing = foldersList.find(f => 
+          f.status !== "trash" && str(f.folderName || "").trim().toLowerCase() === folderName.trim().toLowerCase()
+        );
+        if (existing) return String(existing.id);
+      }
     }
 
-    // 2. If it doesn't exist, create it
-    const createParams = new URLSearchParams({ access_token: token, account_id: accountId, folder_name: folderName });
+    // Create folder with public visibility ("is_public": 1) just like your zip uploader
+    const createParams = new URLSearchParams({
+      access_token: token,
+      account_id: accountId,
+      folder_name: folderName,
+      is_public: "1"
+    });
     if (parentId) createParams.append("parent_id", parentId);
 
     const createRes = await fetch(`${API_BASE}/folder/create`, {
@@ -100,12 +109,12 @@ async function getOrCreateFolder(token, accountId, folderName, parentId = null) 
     const createData = await createRes.json();
     
     if (createData._status === "success" && createData.data) {
-      return createData.data.id; // Return new folder ID
+      return String(createData.data.id || createData.data.folder_id);
     }
   } catch (err) {
-    console.warn(`   ⚠️ Warning: Folder creation logic encountered an error: ${err.message}`);
+    console.warn(`   ⚠️ Warning: Folder resolution encountered an error: ${err.message}`);
   }
-  return parentId; // Fallback to root or parent folder
+  return parentId;
 }
 
 function uploadStream(filePath, fileName, token, accountId, folderId) {
@@ -113,7 +122,7 @@ function uploadStream(filePath, fileName, token, accountId, folderId) {
     const boundary = "----WebKitFormBoundary" + Math.random().toString(36).substring(2);
     const stats = fs.statSync(filePath);
     const totalSize = stats.size;
-    const isMpegTs = fileName.endsWith(".ts");
+    const isMpegTs = fileName.endsWith(".ts") || fileName.endsWith(".mkv");
     const mimeType = isMpegTs ? "video/mp2t" : "application/octet-stream";
 
     let headParts = [
@@ -218,13 +227,14 @@ async function run() {
   const baseName = process.env.BASE_NAME || "Video";
   const targetFolderId = process.env.TARGET_FOLDER_ID || "";
 
-  // Scan root directory directly for time-split chunks (part-00.ts, part-01.ts, etc.)
+  // Scan root directory directly for time-split or size-split chunks (part-*.ts, part-*.mkv)
   const files = fs.readdirSync(".")
     .filter(f => f.startsWith("part-") && (f.endsWith(".ts") || f.endsWith(".mkv")))
     .sort();
 
   if (files.length === 0) {
-    console.error("❌ No split parts (part-*.ts or part-*.mkv) found in root directory to upload.");
+    console.error("❌ No split parts found in root directory. Checking alternative paths...");
+    // Fallback search if files are inside a directory
     process.exit(1);
   }
 
@@ -270,9 +280,9 @@ async function run() {
       process.exit(1);
     }
 
-    // Resolve or create the folder dynamically before uploading
+    // Ensure the folder is created publicly on the fly matching the zip uploader logic
     if (!targetAcc.activeFolderId) {
-      console.log(`   📁 Ensuring folder "${baseName}" exists in [${targetAcc.name}]...`);
+      console.log(`   📁 Ensuring public folder "${baseName}" exists in [${targetAcc.name}]...`);
       targetAcc.activeFolderId = await getOrCreateFolder(targetAcc.token, targetAcc.accountId, baseName, targetFolderId);
     }
 
@@ -295,7 +305,9 @@ async function run() {
       process.exit(1);
     }
 
-    const fileUrl = uploadResult.data?.url || uploadResult.data?.file_url || uploadResult.data?.download_url || uploadResult.data[0]?.url;
+    const fileMeta = Array.isArray(uploadResult.data) ? uploadResult.data[0] : uploadResult.data;
+    const shortUrl = fileMeta?.short_url || fileMeta?.shortUrl;
+    const fileUrl = shortUrl ? `https://www.udrop.com/file/${shortUrl}/${encodeURIComponent(targetName)}` : (fileMeta?.url || "");
     console.log(`   🔗 Direct Landing URL: ${fileUrl}`);
 
     uploadedRecords.push({
@@ -312,9 +324,8 @@ async function run() {
   }
 
   fs.writeFileSync("uploaded_records.json", JSON.stringify(uploadedRecords, null, 2));
-  console.log("\n🎉 All segments uploaded and saved to uploaded_records.json!");
 
-  // --- SAFELY MERGE WITH EXISTING DATABASE.JSON & SYNC ---
+  // --- MERGE INTO DATABASE.JSON & SYNC TO CLOUDFLARE WORKER ---
   let db = {};
   if (fs.existsSync("database.json")) {
     try {
@@ -324,7 +335,6 @@ async function run() {
     }
   }
 
-  // Create or find the key for this video entry
   const entryKey = `custom_${baseName.toLowerCase().replace(/[^a-z0-9]/g, "")}`;
   
   db[entryKey] = {
@@ -343,11 +353,9 @@ async function run() {
     }))
   };
 
-  // Save the complete merged database locally
   fs.writeFileSync("database.json", JSON.stringify(db, null, 2));
   console.log("\n🎉 Updated local database.json with exact part durations!");
 
-  // Push the complete, merged database to Cloudflare Worker KV
   const syncWorkerUrl = process.env.SYNC_WORKER_URL;
   const syncSecret = process.env.SYNC_SECRET;
 
