@@ -33,11 +33,21 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: 'npm'
 
       - name: Setup Python (For Playwright Skydrop Bypass)
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
+      # Cache APT packages so ffmpeg, ffprobe, mkvmerge, and aria2 don't download from internet every time
+      - name: Cache APT Packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-packages-${{ runner.os }}-media-tools-v1
+          restore-keys: |
+            apt-packages-${{ runner.os }}-media-tools-
 
       - name: Cache Playwright Browsers
         uses: actions/cache@v4
@@ -48,15 +58,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-playwright-chromium-
 
-      - name: Cache APT Packages
-        uses: actions/cache@v4
-        with:
-          path: /var/cache/apt/archives
-          key: apt-media-tools-${{ runner.os }}
-
-      - name: Install System Tools (FFmpeg, MKVToolNix, Aria2)
+      - name: Install System Tools (FFmpeg, MKVToolNix, Aria2) with Local Cache Fallback
         run: |
-          sudo apt-get update
+          sudo apt-get update -y
+          # Ensure local cache folder exists for apt
+          sudo mkdir -p /var/cache/apt/archives
           sudo apt-get install -y --no-install-recommends ffmpeg mkvtoolnix aria2 wget curl
           pip install --no-cache-dir requests requests-toolbelt playwright
 
@@ -132,4 +138,6 @@ jobs:
         env:
           UDROP_ACCOUNTS_JSON: ${{ secrets.UDROP_ACCOUNTS_JSON }}
           BASE_NAME: ${{ inputs.file_name }}
+          SYNC_WORKER_URL: ${{ secrets.SYNC_WORKER_URL }}
+          SYNC_SECRET: ${{ secrets.SYNC_SECRET }}
         run: node uploader.js
